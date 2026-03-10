@@ -1,0 +1,121 @@
+{{define "user_charts"}}
+<div id="user-charts">
+{{if or .ActivityJSON .SizeBucketJSON}}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+{{end}}
+
+{{if .ActivityJSON}}
+<section class="section">
+  <h2 class="section-title">Activity Over Time</h2>
+  <p class="chart-hint">Monthly PRs merged (authored) and reviews given. CR rate shows how often their own PRs received changes requested.</p>
+  <div class="chart-row">
+    <div class="chart-card">
+      <div class="chart-label">PRs authored vs. reviews given</div>
+      <div class="chart-wrap"><canvas id="uc-activity"></canvas></div>
+    </div>
+    <div class="chart-aside" id="uc-activity-aside"></div>
+  </div>
+  <div class="chart-row">
+    <div class="chart-card">
+      <div class="chart-label">Changes requested rate on own PRs (%)</div>
+      <div class="chart-wrap"><canvas id="uc-crrate"></canvas></div>
+    </div>
+    <div class="chart-aside" id="uc-crrate-aside"></div>
+  </div>
+</section>
+<script>
+(function() {
+  var a = {{.ActivityJSON}};
+  if (!a.labels || !a.labels.length) return;
+  var tickColor = '#848d97', gridColor = '#30363d';
+  var baseX = { ticks: { color: tickColor, font: { size: 11 }, maxRotation: 45 }, grid: { color: gridColor } };
+  var baseY = function(cb) { var tk={color:tickColor,font:{size:11}}; if(cb)tk.callback=cb; return {ticks:tk,grid:{color:gridColor},beginAtZero:true}; };
+  var lineOpts = {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { display: true, labels: { color: tickColor, font: { size: 11 }, boxWidth: 12 } } },
+    elements: { line: { tension: 0.3 }, point: { radius: 2, hoverRadius: 4 } }
+  };
+  var noLegend = Object.assign({}, lineOpts, { plugins: Object.assign({}, lineOpts.plugins, { legend: { display: false } }) });
+
+  new Chart(document.getElementById('uc-activity'), {
+    type: 'line',
+    data: { labels: a.labels, datasets: [
+      { label: 'PRs authored', data: a.prCounts,    borderColor: '#58a6ff', backgroundColor: '#58a6ff15', borderWidth: 2, fill: true },
+      { label: 'Reviews given', data: a.reviewCounts, borderColor: '#3fb950', backgroundColor: '#3fb95015', borderWidth: 2, fill: true }
+    ]},
+    options: Object.assign({}, lineOpts, { scales: { x: baseX, y: baseY() } })
+  });
+  new Chart(document.getElementById('uc-crrate'), {
+    type: 'line',
+    data: { labels: a.labels, datasets: [
+      { data: a.crRate, borderColor: '#f85149', backgroundColor: '#f8514915', borderWidth: 2, fill: true }
+    ]},
+    options: Object.assign({}, noLegend, { scales: { x: baseX, y: { min: 0, max: 100, ticks: { color: tickColor, font: { size: 11 }, callback: function(v) { return v + '%'; } }, grid: { color: gridColor } } } })
+  });
+
+  var n = a.labels.length, first = a.labels[0], latest = a.labels[n-1];
+  function statCard(num, lbl) {
+    var d = document.createElement('div'); d.className = 'chart-stat';
+    var s1 = document.createElement('span'); s1.className = 'chart-stat-num'; s1.textContent = num;
+    var s2 = document.createElement('span'); s2.className = 'chart-stat-label'; s2.textContent = lbl;
+    d.appendChild(s1); d.appendChild(s2); return d;
+  }
+  var actAside = document.getElementById('uc-activity-aside');
+  actAside.appendChild(statCard(a.prCounts[n-1] + ' PRs', 'authored, ' + latest));
+  actAside.appendChild(statCard(a.reviewCounts[n-1] + ' reviews', 'given, ' + latest));
+  actAside.appendChild(statCard(Math.max.apply(null, a.prCounts) + ' PRs', 'peak month authored'));
+  actAside.appendChild(statCard(Math.max.apply(null, a.reviewCounts) + ' reviews', 'peak month reviewed'));
+
+  var crAside = document.getElementById('uc-crrate-aside');
+  crAside.appendChild(statCard(a.crRate[n-1] + '%', 'CR rate, ' + latest));
+  crAside.appendChild(statCard(a.crRate[0] + '%', 'CR rate, ' + first));
+})();
+</script>
+{{end}}
+
+{{if .SizeBucketJSON}}
+<section class="section">
+  <h2 class="section-title">PR Size Distribution</h2>
+  <p class="chart-hint">How big are their PRs? Lines changed (additions + deletions) grouped into buckets.</p>
+  <div class="chart-row">
+    <div class="chart-card">
+      <div class="chart-label">Merged PRs by size bucket</div>
+      <div class="chart-wrap"><canvas id="uc-size"></canvas></div>
+    </div>
+    <div class="chart-aside" id="uc-size-aside"></div>
+  </div>
+</section>
+<script>
+(function() {
+  var s = {{.SizeBucketJSON}};
+  if (!s.labels || !s.labels.length) return;
+  var tickColor = '#848d97', gridColor = '#30363d';
+  var opts = { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+    scales: {
+      x: { ticks: { color: tickColor, font: { size: 11 } }, grid: { color: gridColor } },
+      y: { ticks: { color: tickColor, font: { size: 11 } }, grid: { color: gridColor }, beginAtZero: true }
+    }
+  };
+  new Chart(document.getElementById('uc-size'), {
+    type: 'bar',
+    data: { labels: s.labels, datasets: [{ data: s.prCounts, backgroundColor: '#58a6ff33', borderColor: '#58a6ff', borderWidth: 1 }] },
+    options: opts
+  });
+  function bucketTable(vals, suffix) {
+    var t = document.createElement('table'); t.className = 'bucket-tbl';
+    for (var i = 0; i < s.labels.length; i++) {
+      var tr = document.createElement('tr'),
+          td1 = document.createElement('td'),
+          td2 = document.createElement('td');
+      td1.textContent = s.labels[i]; td2.textContent = vals[i] + (suffix || '');
+      tr.appendChild(td1); tr.appendChild(td2); t.appendChild(tr);
+    }
+    return t;
+  }
+  document.getElementById('uc-size-aside').appendChild(bucketTable(s.prCounts, ' PRs'));
+})();
+</script>
+{{end}}
+
+</div>{{/* end #user-charts */}}
+{{end}}

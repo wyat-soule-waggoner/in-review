@@ -71,6 +71,8 @@ func main() {
 	r.Get("/leaderboard/{category}/rows", h.LeaderboardRows)
 	r.Get("/leaderboard/{category}/search", h.LeaderboardSearch)
 	r.Get("/api/leaderboard", h.LeaderboardAPI)
+	r.Get("/api/repo/{owner}/{name}/charts", h.RepoCharts)
+	r.Get("/api/user/{username}/charts", h.UserCharts)
 	r.Post("/api/sync/{owner}/{name}", h.TriggerSync)
 	r.Get("/api/sync-status/{owner}/{name}", h.SyncStatus)
 	r.Get("/hi-wall", h.HiWall)

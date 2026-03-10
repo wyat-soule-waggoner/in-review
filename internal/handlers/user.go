@@ -13,6 +13,37 @@ import (
 	"inreview/internal/db"
 )
 
+const userPageCacheTTL = 5 * time.Minute
+
+// userPageCache holds the DB-query results for a user page, serialized to Redis.
+// Chart data (activity/size) is excluded — it lives in its own cache via UserCharts.
+type userPageCache struct {
+	ReviewerStats  *db.ReviewerStats   `json:"reviewerStats"`
+	AuthorStats    *db.AuthorStats     `json:"authorStats"`
+	ReviewerRank   int                 `json:"reviewerRank"`
+	GatekeeperRank int                 `json:"gatekeeperRank"`
+	AuthorRank     int                 `json:"authorRank"`
+	ContribRepos   []db.Repo           `json:"contribRepos"`
+	FastestPR      *db.UserRecordPR    `json:"fastestPR"`
+	SlowestPR      *db.UserRecordPR    `json:"slowestPR"`
+	ReviewedRepos  []db.UserRepoReview `json:"reviewedRepos"`
+	ReviewersOfMe  []db.CollabEntry    `json:"reviewersOfMe"`
+	AuthorsIReview []db.CollabEntry    `json:"authorsIReview"`
+}
+
+// UserChartsData is passed to the user_charts partial.
+type UserChartsData struct {
+	ActivityJSON   template.JS
+	SizeBucketJSON template.JS
+}
+
+const userChartsCacheTTL = 5 * time.Minute
+
+type userChartsCache struct {
+	ActivityJSON   string `json:"activityJSON"`
+	SizeBucketJSON string `json:"sizeBucketJSON"`
+}
+
 type userActivityPayload struct {
 	Labels      []string  `json:"labels"`
 	PRCounts    []int     `json:"prCounts"`
@@ -36,8 +67,6 @@ type UserData struct {
 	ContributedRepos []db.Repo
 	FastestPR        *db.UserRecordPR
 	SlowestPR        *db.UserRecordPR
-	ActivityJSON     template.JS
-	SizeBucketJSON   template.JS
 	ReviewedRepos    []db.UserRepoReview
 	ReviewersOfMe    []db.CollabEntry
 	AuthorsIReview   []db.CollabEntry
@@ -127,112 +156,109 @@ func (h *Handler) User(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	type rrRes struct {
-		v   *db.ReviewerStats
-		err error
-	}
-	type arRes struct {
-		v   *db.AuthorStats
-		err error
-	}
-	type recRes struct {
-		fastest, slowest *db.UserRecordPR
-	}
-	type actRes struct {
-		v   []db.UserActivityPoint
-		err error
-	}
-	type sizeRes struct {
-		v   []db.PRSizeBucket
-		err error
-	}
-	type collabRes struct {
-		reviewersOfMe  []db.CollabEntry
-		authorsIReview []db.CollabEntry
-	}
-	type reviewedReposRes struct {
-		v   []db.UserRepoReview
-		err error
+	// ── Cache check ──────────────────────────────────────────────────────────
+	var pc userPageCache
+	cacheKey := fmt.Sprintf("user:v1:%s", username)
+	cacheHit := false
+	if h.cache != nil {
+		if raw, ok := h.cache.Get(r.Context(), cacheKey); ok {
+			if json.Unmarshal(raw, &pc) == nil {
+				cacheHit = true
+			}
+		}
 	}
 
-	rrCh   := make(chan rrRes, 1)
-	arCh   := make(chan arRes, 1)
-	rrankCh := make(chan int, 1)
-	gkCh   := make(chan int, 1)
-	auCh   := make(chan int, 1)
-	contCh := make(chan []db.Repo, 1)
-	recCh  := make(chan recRes, 1)
-	actCh  := make(chan actRes, 1)
-	sizeCh := make(chan sizeRes, 1)
-	colCh  := make(chan collabRes, 1)
-	rvRepCh := make(chan reviewedReposRes, 1)
+	if !cacheHit {
+		type rrRes struct {
+			v   *db.ReviewerStats
+			err error
+		}
+		type arRes struct {
+			v   *db.AuthorStats
+			err error
+		}
+		type recRes struct {
+			fastest, slowest *db.UserRecordPR
+		}
+		type collabRes struct {
+			reviewersOfMe  []db.CollabEntry
+			authorsIReview []db.CollabEntry
+		}
+		type reviewedReposRes struct {
+			v   []db.UserRepoReview
+			err error
+		}
 
-	go func() { v, err := h.db.UserReviewerStats(username); rrCh <- rrRes{v, err} }()
-	go func() { v, err := h.db.UserAuthorStats(username); arCh <- arRes{v, err} }()
-	go func() { v, _ := h.db.UserReviewerRank(username); rrankCh <- v }()
-	go func() { v, _ := h.db.UserGatekeeperRank(username); gkCh <- v }()
-	go func() { v, _ := h.db.UserAuthorRank(username); auCh <- v }()
-	go func() { v, _ := h.db.UserContributedRepos(username, 10); contCh <- v }()
-	go func() {
-		f, s, _ := h.db.UserRecordPRs(username)
-		recCh <- recRes{f, s}
-	}()
-	go func() { v, err := h.db.UserActivitySeries(username); actCh <- actRes{v, err} }()
-	go func() { v, err := h.db.UserPRSizeDist(username); sizeCh <- sizeRes{v, err} }()
-	go func() {
-		rm, ai, _ := h.db.UserTopCollaborators(username, 5)
-		colCh <- collabRes{rm, ai}
-	}()
-	go func() { v, err := h.db.UserTopReviewedRepos(username, 8); rvRepCh <- reviewedReposRes{v, err} }()
+		rrCh    := make(chan rrRes, 1)
+		arCh    := make(chan arRes, 1)
+		rrankCh := make(chan int, 1)
+		gkCh    := make(chan int, 1)
+		auCh    := make(chan int, 1)
+		contCh  := make(chan []db.Repo, 1)
+		recCh   := make(chan recRes, 1)
+		colCh   := make(chan collabRes, 1)
+		rvRepCh := make(chan reviewedReposRes, 1)
 
-	rrResult   := <-rrCh
-	arResult   := <-arCh
-	rec        := <-recCh
-	act        := <-actCh
-	sizeResult := <-sizeCh
-	col        := <-colCh
-	rvRep      := <-rvRepCh
+		go func() { v, err := h.db.UserReviewerStats(username); rrCh <- rrRes{v, err} }()
+		go func() { v, err := h.db.UserAuthorStats(username); arCh <- arRes{v, err} }()
+		go func() { v, _ := h.db.UserReviewerRank(username); rrankCh <- v }()
+		go func() { v, _ := h.db.UserGatekeeperRank(username); gkCh <- v }()
+		go func() { v, _ := h.db.UserAuthorRank(username); auCh <- v }()
+		go func() { v, _ := h.db.UserContributedRepos(username, 10); contCh <- v }()
+		go func() {
+			f, s, _ := h.db.UserRecordPRs(username)
+			recCh <- recRes{f, s}
+		}()
+		go func() {
+			rm, ai, _ := h.db.UserTopCollaborators(username, 5)
+			colCh <- collabRes{rm, ai}
+		}()
+		go func() { v, err := h.db.UserTopReviewedRepos(username, 8); rvRepCh <- reviewedReposRes{v, err} }()
+
+		rrResult := <-rrCh
+		arResult := <-arCh
+		rec      := <-recCh
+		col      := <-colCh
+		rvRep    := <-rvRepCh
+
+		pc = userPageCache{
+			ReviewerStats:  rrResult.v,
+			AuthorStats:    arResult.v,
+			ReviewerRank:   <-rrankCh,
+			GatekeeperRank: <-gkCh,
+			AuthorRank:     <-auCh,
+			ContribRepos:   <-contCh,
+			FastestPR:      rec.fastest,
+			SlowestPR:      rec.slowest,
+			ReviewedRepos:  rvRep.v,
+			ReviewersOfMe:  col.reviewersOfMe,
+			AuthorsIReview: col.authorsIReview,
+		}
+
+		if h.cache != nil {
+			if raw, err := json.Marshal(pc); err == nil {
+				h.cache.Set(r.Context(), cacheKey, raw, userPageCacheTTL)
+			}
+		}
+	}
 
 	data := UserData{
-		User:           user,
-		IsOrg:          false,
-		ReviewerStats:  rrResult.v,
-		AuthorStats:    arResult.v,
-		ReviewerRank:   <-rrankCh,
-		GatekeeperRank: <-gkCh,
-		AuthorRank:     <-auCh,
-		ContributedRepos: <-contCh,
-		FastestPR:      rec.fastest,
-		SlowestPR:      rec.slowest,
-		ReviewersOfMe:  col.reviewersOfMe,
-		AuthorsIReview: col.authorsIReview,
-		ReviewedRepos:  rvRep.v,
+		User:             user,
+		IsOrg:            false,
+		ReviewerStats:    pc.ReviewerStats,
+		AuthorStats:      pc.AuthorStats,
+		ReviewerRank:     pc.ReviewerRank,
+		GatekeeperRank:   pc.GatekeeperRank,
+		AuthorRank:       pc.AuthorRank,
+		ContributedRepos: pc.ContribRepos,
+		FastestPR:        pc.FastestPR,
+		SlowestPR:        pc.SlowestPR,
+		ReviewersOfMe:    pc.ReviewersOfMe,
+		AuthorsIReview:   pc.AuthorsIReview,
+		ReviewedRepos:    pc.ReviewedRepos,
 	}
+
 	data.IsNGMI = data.ReviewerStats == nil || data.ReviewerStats.TotalReviews < 10
-
-	if len(act.v) > 0 {
-		ap := userActivityPayload{}
-		for _, p := range act.v {
-			ap.Labels = append(ap.Labels, p.Label)
-			ap.PRCounts = append(ap.PRCounts, p.PRCount)
-			ap.ReviewCounts = append(ap.ReviewCounts, p.ReviewCount)
-			ap.CRRate = append(ap.CRRate, roundTo1(p.ChangesRequestedRate))
-		}
-		if raw, err := json.Marshal(ap); err == nil {
-			data.ActivityJSON = template.JS(raw)
-		}
-	}
-
-	if len(sizeResult.v) > 0 {
-		sp := userSizePayload{}
-		for _, b := range sizeResult.v {
-			sp.Labels = append(sp.Labels, b.Label)
-			sp.PRCounts = append(sp.PRCounts, b.PRCount)
-		}
-		if raw, err := json.Marshal(sp); err == nil {
-			data.SizeBucketJSON = template.JS(raw)
-		}
-	}
 
 	// ── OG / share metadata ───────────────────────────────────────────────────
 	data.OGUrl = "https://ngmi.review/user/" + username
@@ -265,4 +291,72 @@ func (h *Handler) User(w http.ResponseWriter, r *http.Request) {
 	data.BaseData = h.baseData(r)
 	h.db.RecordVisit("/user/"+username, "user", username)
 	h.render(w, "user", data)
+}
+
+// UserCharts returns the lazy-loaded charts partial for a user page.
+// Called via HTMX (hx-trigger="load") so chart queries don't block the initial render.
+func (h *Handler) UserCharts(w http.ResponseWriter, r *http.Request) {
+	username := chi.URLParam(r, "username")
+
+	cacheKey := fmt.Sprintf("user:charts:v1:%s", username)
+	if h.cache != nil {
+		if raw, ok := h.cache.Get(r.Context(), cacheKey); ok {
+			var cc userChartsCache
+			if json.Unmarshal(raw, &cc) == nil {
+				h.renderPartial(w, "user_charts", UserChartsData{
+					ActivityJSON:   template.JS(cc.ActivityJSON),
+					SizeBucketJSON: template.JS(cc.SizeBucketJSON),
+				})
+				return
+			}
+		}
+	}
+
+	type actRes struct{ v []db.UserActivityPoint }
+	type sizeRes struct{ v []db.PRSizeBucket }
+	actCh  := make(chan actRes, 1)
+	sizeCh := make(chan sizeRes, 1)
+	go func() { v, _ := h.db.UserActivitySeries(username); actCh <- actRes{v} }()
+	go func() { v, _ := h.db.UserPRSizeDist(username); sizeCh <- sizeRes{v} }()
+
+	activity := (<-actCh).v
+	sizeDist := (<-sizeCh).v
+
+	cd := UserChartsData{}
+
+	if len(activity) > 0 {
+		ap := userActivityPayload{}
+		for _, p := range activity {
+			ap.Labels = append(ap.Labels, p.Label)
+			ap.PRCounts = append(ap.PRCounts, p.PRCount)
+			ap.ReviewCounts = append(ap.ReviewCounts, p.ReviewCount)
+			ap.CRRate = append(ap.CRRate, roundTo1(p.ChangesRequestedRate))
+		}
+		if raw, err := json.Marshal(ap); err == nil {
+			cd.ActivityJSON = template.JS(raw)
+		}
+	}
+
+	if len(sizeDist) > 0 {
+		sp := userSizePayload{}
+		for _, b := range sizeDist {
+			sp.Labels = append(sp.Labels, b.Label)
+			sp.PRCounts = append(sp.PRCounts, b.PRCount)
+		}
+		if raw, err := json.Marshal(sp); err == nil {
+			cd.SizeBucketJSON = template.JS(raw)
+		}
+	}
+
+	if h.cache != nil {
+		cc := userChartsCache{
+			ActivityJSON:   string(cd.ActivityJSON),
+			SizeBucketJSON: string(cd.SizeBucketJSON),
+		}
+		if raw, err := json.Marshal(cc); err == nil {
+			h.cache.Set(r.Context(), cacheKey, raw, userChartsCacheTTL)
+		}
+	}
+
+	h.renderPartial(w, "user_charts", cd)
 }

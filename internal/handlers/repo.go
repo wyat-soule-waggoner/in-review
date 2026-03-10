@@ -15,19 +15,43 @@ import (
 
 type RepoData struct {
 	BaseData
-	Repo          *db.Repo
-	TopReviewers  []db.ReviewerStats
-	RecentPRs     []db.PullRequest
-	SpeedRank     int
-	IsSyncing     bool
-	OwnerUser     *db.User
+	Repo         *db.Repo
+	TopReviewers []db.ReviewerStats
+	RecentPRs    []db.PullRequest
+	SpeedRank    int
+	IsSyncing    bool
+	OwnerUser    *db.User
+	Trim         int
+	OGTitle      string
+	OGDesc       string
+	OGUrl        string
+	ShareURL     string
+}
+
+const repoPageCacheTTL = 5 * time.Minute
+
+// repoPageCache holds the non-chart DB-query results for a repo page.
+type repoPageCache struct {
+	TopReviewers []db.ReviewerStats `json:"topReviewers"`
+	RecentPRs    []db.PullRequest   `json:"recentPRs"`
+	SpeedRank    int                `json:"speedRank"`
+}
+
+// RepoChartsData is passed to the repo_charts partial.
+type RepoChartsData struct {
+	Owner         string
+	Name          string
+	Trim          int
 	SizeChartJSON template.JS
 	TimeChartJSON template.JS
-	Trim          int
-	OGTitle       string
-	OGDesc        string
-	OGUrl         string
-	ShareURL      string
+}
+
+const repoChartsCacheTTL = 5 * time.Minute
+
+// repoChartsCache holds the chart query results for the lazy-loaded charts partial.
+type repoChartsCache struct {
+	SizeChartJSON string `json:"sizeChartJSON"`
+	TimeChartJSON string `json:"timeChartJSON"`
 }
 
 // sizeChartPayload is marshaled to JSON and embedded directly in the repo page.
@@ -43,7 +67,7 @@ func (h *Handler) Repo(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 	fullName := owner + "/" + name
 
-	trim, cutoffPct := parseTrim(r)
+	trim, _ := parseTrim(r)
 
 	// Ensure repo is in DB
 	repo, _ := h.db.GetRepo(fullName)
@@ -89,44 +113,49 @@ func (h *Handler) Repo(w http.ResponseWriter, r *http.Request) {
 		IsSyncing: h.worker.IsSyncing(fullName),
 		Trim:      trim,
 	}
-
-	data.TopReviewers, _ = h.db.RepoTopReviewers(fullName, 10)
-	data.RecentPRs, _ = h.db.RecentMergedPRs(fullName, 20)
-	data.SpeedRank, _ = h.db.RepoSpeedRank(fullName)
 	data.OwnerUser, _ = h.db.GetUser(owner)
 
-	if buckets, err := h.db.RepoSizeChartData(fullName, cutoffPct); err == nil && len(buckets) > 0 {
-		payload := sizeChartPayload{}
-		for _, b := range buckets {
-			payload.Labels = append(payload.Labels, b.Label)
-			payload.PRCounts = append(payload.PRCounts, b.PRCount)
-			payload.AvgHours = append(payload.AvgHours, roundTo1(b.AvgSecs/3600))
-			payload.ApprovalRate = append(payload.ApprovalRate, roundTo1(b.ApprovalRate))
-		}
-		if raw, err := json.Marshal(payload); err == nil {
-			data.SizeChartJSON = template.JS(raw)
+	// ── Cache check ──────────────────────────────────────────────────────────
+	var rpc repoPageCache
+	repoCacheKey := fmt.Sprintf("repo:v1:%s", fullName)
+	repoCacheHit := false
+	if h.cache != nil {
+		if raw, ok := h.cache.Get(r.Context(), repoCacheKey); ok {
+			if json.Unmarshal(raw, &rpc) == nil {
+				repoCacheHit = true
+			}
 		}
 	}
 
-	if points, err := h.db.RepoTimeSeriesData(fullName, cutoffPct); err == nil && len(points) > 0 {
-		tp := timeChartPayload{}
-		for _, p := range points {
-			tp.Labels = append(tp.Labels, p.Label)
-			tp.PRCounts = append(tp.PRCounts, p.PRCount)
-			tp.AvgSize = append(tp.AvgSize, roundTo1(p.AvgSize))
-			tp.MedianSize = append(tp.MedianSize, roundTo1(p.MedianSize))
-			tp.AvgHours = append(tp.AvgHours, roundTo1(p.AvgSecs/3600))
-			tp.MedianHours = append(tp.MedianHours, roundTo1(p.MedianSecs/3600))
-			tp.ChangesRequestedRate = append(tp.ChangesRequestedRate, roundTo1(p.ChangesRequestedRate))
-			tp.AvgFirstReviewHours = append(tp.AvgFirstReviewHours, roundTo1(p.AvgFirstReviewSecs/3600))
-			tp.MedFirstReviewHours = append(tp.MedFirstReviewHours, roundTo1(p.MedFirstReviewSecs/3600))
-			tp.UnreviewedMergeRate = append(tp.UnreviewedMergeRate, roundTo1(p.UnreviewedRate))
-			tp.LinesPerContrib = append(tp.LinesPerContrib, roundTo1(p.LinesPerContrib))
+	if !repoCacheHit {
+		type reviewersRes struct{ v []db.ReviewerStats }
+		type recentRes struct{ v []db.PullRequest }
+		type rankRes struct{ v int }
+
+		rvCh := make(chan reviewersRes, 1)
+		rcCh := make(chan recentRes, 1)
+		rkCh := make(chan rankRes, 1)
+
+		go func() { v, _ := h.db.RepoTopReviewers(fullName, 10); rvCh <- reviewersRes{v} }()
+		go func() { v, _ := h.db.RecentMergedPRs(fullName, 20); rcCh <- recentRes{v} }()
+		go func() { v, _ := h.db.RepoSpeedRank(fullName); rkCh <- rankRes{v} }()
+
+		rpc = repoPageCache{
+			TopReviewers: (<-rvCh).v,
+			RecentPRs:    (<-rcCh).v,
+			SpeedRank:    (<-rkCh).v,
 		}
-		if raw, err := json.Marshal(tp); err == nil {
-			data.TimeChartJSON = template.JS(raw)
+
+		if h.cache != nil {
+			if raw, err := json.Marshal(rpc); err == nil {
+				h.cache.Set(r.Context(), repoCacheKey, raw, repoPageCacheTTL)
+			}
 		}
 	}
+
+	data.TopReviewers = rpc.TopReviewers
+	data.RecentPRs = rpc.RecentPRs
+	data.SpeedRank = rpc.SpeedRank
 
 	// ── OG / share metadata ───────────────────────────────────────────────────
 	data.OGTitle = fullName + " — ngmi"
@@ -155,6 +184,90 @@ func (h *Handler) Repo(w http.ResponseWriter, r *http.Request) {
 	data.BaseData = h.baseData(r)
 	h.db.RecordVisit("/repo/"+fullName, "repo", fullName)
 	h.render(w, "repo", data)
+}
+
+// RepoCharts returns the lazy-loaded charts partial for a repo page.
+// It is called via HTMX (hx-trigger="load") so the heavy percentile queries
+// don't block the initial page render.
+func (h *Handler) RepoCharts(w http.ResponseWriter, r *http.Request) {
+	owner    := chi.URLParam(r, "owner")
+	name     := chi.URLParam(r, "name")
+	fullName := owner + "/" + name
+	trim, cutoffPct := parseTrim(r)
+
+	cacheKey := fmt.Sprintf("repo:charts:v1:%s:%d", fullName, trim)
+	if h.cache != nil {
+		if raw, ok := h.cache.Get(r.Context(), cacheKey); ok {
+			var cc repoChartsCache
+			if json.Unmarshal(raw, &cc) == nil {
+				h.renderPartial(w, "repo_charts", RepoChartsData{
+					Owner:         owner,
+					Name:          name,
+					Trim:          trim,
+					SizeChartJSON: template.JS(cc.SizeChartJSON),
+					TimeChartJSON: template.JS(cc.TimeChartJSON),
+				})
+				return
+			}
+		}
+	}
+
+	type bucketsRes struct{ v []db.PRSizeBucket }
+	type pointsRes struct{ v []db.TimeSeriesPoint }
+	buCh := make(chan bucketsRes, 1)
+	ptCh := make(chan pointsRes, 1)
+	go func() { v, _ := h.db.RepoSizeChartData(fullName, cutoffPct); buCh <- bucketsRes{v} }()
+	go func() { v, _ := h.db.RepoTimeSeriesData(fullName, cutoffPct); ptCh <- pointsRes{v} }()
+
+	buckets := (<-buCh).v
+	points  := (<-ptCh).v
+
+	cd := RepoChartsData{Owner: owner, Name: name, Trim: trim}
+
+	if len(buckets) > 0 {
+		payload := sizeChartPayload{}
+		for _, b := range buckets {
+			payload.Labels = append(payload.Labels, b.Label)
+			payload.PRCounts = append(payload.PRCounts, b.PRCount)
+			payload.AvgHours = append(payload.AvgHours, roundTo1(b.AvgSecs/3600))
+			payload.ApprovalRate = append(payload.ApprovalRate, roundTo1(b.ApprovalRate))
+		}
+		if raw, err := json.Marshal(payload); err == nil {
+			cd.SizeChartJSON = template.JS(raw)
+		}
+	}
+
+	if len(points) > 0 {
+		tp := timeChartPayload{}
+		for _, p := range points {
+			tp.Labels = append(tp.Labels, p.Label)
+			tp.PRCounts = append(tp.PRCounts, p.PRCount)
+			tp.AvgSize = append(tp.AvgSize, roundTo1(p.AvgSize))
+			tp.MedianSize = append(tp.MedianSize, roundTo1(p.MedianSize))
+			tp.AvgHours = append(tp.AvgHours, roundTo1(p.AvgSecs/3600))
+			tp.MedianHours = append(tp.MedianHours, roundTo1(p.MedianSecs/3600))
+			tp.ChangesRequestedRate = append(tp.ChangesRequestedRate, roundTo1(p.ChangesRequestedRate))
+			tp.AvgFirstReviewHours = append(tp.AvgFirstReviewHours, roundTo1(p.AvgFirstReviewSecs/3600))
+			tp.MedFirstReviewHours = append(tp.MedFirstReviewHours, roundTo1(p.MedFirstReviewSecs/3600))
+			tp.UnreviewedMergeRate = append(tp.UnreviewedMergeRate, roundTo1(p.UnreviewedRate))
+			tp.LinesPerContrib = append(tp.LinesPerContrib, roundTo1(p.LinesPerContrib))
+		}
+		if raw, err := json.Marshal(tp); err == nil {
+			cd.TimeChartJSON = template.JS(raw)
+		}
+	}
+
+	if h.cache != nil {
+		cc := repoChartsCache{
+			SizeChartJSON: string(cd.SizeChartJSON),
+			TimeChartJSON: string(cd.TimeChartJSON),
+		}
+		if raw, err := json.Marshal(cc); err == nil {
+			h.cache.Set(r.Context(), cacheKey, raw, repoChartsCacheTTL)
+		}
+	}
+
+	h.renderPartial(w, "repo_charts", cd)
 }
 
 // TriggerSync forces a fresh sync for a repo.

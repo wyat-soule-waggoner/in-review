@@ -198,6 +198,7 @@ func (h *Handler) loadTemplates() {
 		"search_results", "leaderboard", "leaderboard_rows", "leaderboard_search",
 		"data_repos", "data_prs", "data_reviews", "data_users",
 		"blog_stats",
+		"repo_charts", "user_charts",
 	}
 	for _, partial := range partials {
 		tmpl := template.Must(

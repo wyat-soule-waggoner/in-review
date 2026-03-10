@@ -281,6 +281,14 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_prs_author_merged ON pull_requests(author_login) WHERE merged=TRUE`,
 		// Retry tracking: stop re-queuing repos that have failed repeatedly.
 		`ALTER TABLE repos ADD COLUMN IF NOT EXISTS error_count INT NOT NULL DEFAULT 0`,
+		// Performance: composite indexes that cover the most expensive GROUP BY paths.
+		// idx_rev_state_reviewer covers state-filtered reviewer aggregations (gatekeeper queries).
+		`CREATE INDEX IF NOT EXISTS idx_rev_state_reviewer ON reviews(state, reviewer_login)`,
+		// idx_prs_repo_merged_secs covers UpdateRepoStats and RepoSizeChartData which filter
+		// repo_full_name + merged=TRUE and aggregate merge_time_secs.
+		`CREATE INDEX IF NOT EXISTS idx_prs_repo_merged_secs ON pull_requests(repo_full_name, merge_time_secs) WHERE merged=TRUE`,
+		// idx_prs_author_merged_at covers UserActivitySeries which groups merged PRs by month per author.
+		`CREATE INDEX IF NOT EXISTS idx_prs_author_merged_at ON pull_requests(author_login, merged_at) WHERE merged=TRUE`,
 	}
 	for _, s := range stmts {
 		if _, err := d.conn.Exec(s); err != nil {
@@ -379,15 +387,25 @@ func (d *DB) UpsertUser(u User) error {
 
 func (d *DB) UpdateRepoStats(fullName string) error {
 	_, err := d.conn.Exec(`
+		WITH stats AS (
+			SELECT
+				COUNT(*)                            AS cnt,
+				COALESCE(AVG(merge_time_secs)::BIGINT, 0) AS avg_secs,
+				COALESCE(MIN(merge_time_secs), 0)   AS min_secs,
+				COALESCE(MAX(merge_time_secs), 0)   AS max_secs
+			FROM pull_requests
+			WHERE repo_full_name=$1 AND merged=TRUE
+		)
 		UPDATE repos SET
-			pr_count            = (SELECT COUNT(*)   FROM pull_requests WHERE repo_full_name=$1 AND merged=TRUE),
-			merged_pr_count     = (SELECT COUNT(*)   FROM pull_requests WHERE repo_full_name=$2 AND merged=TRUE),
-			avg_merge_time_secs = COALESCE((SELECT AVG(merge_time_secs) FROM pull_requests WHERE repo_full_name=$3 AND merged=TRUE AND merge_time_secs IS NOT NULL)::BIGINT, 0),
-			min_merge_time_secs = COALESCE((SELECT MIN(merge_time_secs) FROM pull_requests WHERE repo_full_name=$4 AND merged=TRUE AND merge_time_secs IS NOT NULL), 0),
-			max_merge_time_secs = COALESCE((SELECT MAX(merge_time_secs) FROM pull_requests WHERE repo_full_name=$5 AND merged=TRUE AND merge_time_secs IS NOT NULL), 0),
+			pr_count            = stats.cnt,
+			merged_pr_count     = stats.cnt,
+			avg_merge_time_secs = stats.avg_secs,
+			min_merge_time_secs = stats.min_secs,
+			max_merge_time_secs = stats.max_secs,
 			updated_at          = NOW()
-		WHERE full_name=$6
-	`, fullName, fullName, fullName, fullName, fullName, fullName)
+		FROM stats
+		WHERE full_name=$1
+	`, fullName)
 	return err
 }
 
