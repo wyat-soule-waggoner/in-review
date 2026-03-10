@@ -276,6 +276,9 @@ func (d *DB) migrate() error {
 			installation_id BIGINT NOT NULL,
 			PRIMARY KEY (github_login, installation_id)
 		)`,
+		// Indexes for leaderboard GROUP BY queries.
+		`CREATE INDEX IF NOT EXISTS idx_rev_state ON reviews(state)`,
+		`CREATE INDEX IF NOT EXISTS idx_prs_author_merged ON pull_requests(author_login) WHERE merged=TRUE`,
 	}
 	for _, s := range stmts {
 		if _, err := d.conn.Exec(s); err != nil {
