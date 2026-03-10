@@ -15,20 +15,28 @@ import (
 
 const userPageCacheTTL = 5 * time.Minute
 
-// userPageCache holds the DB-query results for a user page, serialized to Redis.
-// Chart data (activity/size) is excluded — it lives in its own cache via UserCharts.
+// userPageCache holds the fast DB-query results for a user page.
+// Rank data is excluded — it's slow and lives in its own cache (userRankCache).
 type userPageCache struct {
 	ReviewerStats  *db.ReviewerStats   `json:"reviewerStats"`
 	AuthorStats    *db.AuthorStats     `json:"authorStats"`
-	ReviewerRank   int                 `json:"reviewerRank"`
-	GatekeeperRank int                 `json:"gatekeeperRank"`
-	AuthorRank     int                 `json:"authorRank"`
 	ContribRepos   []db.Repo           `json:"contribRepos"`
 	FastestPR      *db.UserRecordPR    `json:"fastestPR"`
 	SlowestPR      *db.UserRecordPR    `json:"slowestPR"`
 	ReviewedRepos  []db.UserRepoReview `json:"reviewedRepos"`
 	ReviewersOfMe  []db.CollabEntry    `json:"reviewersOfMe"`
 	AuthorsIReview []db.CollabEntry    `json:"authorsIReview"`
+}
+
+// userRankCache holds the pre-computed global rank numbers for a user.
+// These are computed asynchronously and cached for 30 minutes because the
+// underlying ROW_NUMBER() GROUP BY queries scan 25M+ rows.
+const userRankCacheTTL = 30 * time.Minute
+
+type userRankCache struct {
+	ReviewerRank   int `json:"reviewerRank"`
+	GatekeeperRank int `json:"gatekeeperRank"`
+	AuthorRank     int `json:"authorRank"`
 }
 
 // UserChartsData is passed to the user_charts partial.
@@ -156,7 +164,41 @@ func (h *Handler) User(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// ── Cache check ──────────────────────────────────────────────────────────
+	// ── Rank cache (separate, 30-min TTL) ────────────────────────────────────
+	// Rank queries scan 25M+ rows with ROW_NUMBER() window functions; they are
+	// computed asynchronously and never block the page render.
+	var ranks userRankCache
+	rankCacheKey := fmt.Sprintf("user:rank:v1:%s", username)
+	rankCacheHit := false
+	if h.cache != nil {
+		if raw, ok := h.cache.Get(r.Context(), rankCacheKey); ok {
+			if json.Unmarshal(raw, &ranks) == nil {
+				rankCacheHit = true
+			}
+		}
+	}
+	if !rankCacheHit && h.cache != nil {
+		// Fire rank computation in a background goroutine. This request gets rank=0;
+		// the next request (or any request within 30 min) gets the cached result.
+		cache := h.cache
+		go func() {
+			bg := context.Background()
+			var rc userRankCache
+			type r1 struct{ v int }
+			c1, c2, c3 := make(chan r1, 1), make(chan r1, 1), make(chan r1, 1)
+			go func() { v, _ := h.db.UserReviewerRank(username); c1 <- r1{v} }()
+			go func() { v, _ := h.db.UserGatekeeperRank(username); c2 <- r1{v} }()
+			go func() { v, _ := h.db.UserAuthorRank(username); c3 <- r1{v} }()
+			rc.ReviewerRank = (<-c1).v
+			rc.GatekeeperRank = (<-c2).v
+			rc.AuthorRank = (<-c3).v
+			if raw, err := json.Marshal(rc); err == nil {
+				cache.Set(bg, rankCacheKey, raw, userRankCacheTTL)
+			}
+		}()
+	}
+
+	// ── Page data cache (fast queries only) ──────────────────────────────────
 	var pc userPageCache
 	cacheKey := fmt.Sprintf("user:v1:%s", username)
 	cacheHit := false
@@ -191,9 +233,6 @@ func (h *Handler) User(w http.ResponseWriter, r *http.Request) {
 
 		rrCh    := make(chan rrRes, 1)
 		arCh    := make(chan arRes, 1)
-		rrankCh := make(chan int, 1)
-		gkCh    := make(chan int, 1)
-		auCh    := make(chan int, 1)
 		contCh  := make(chan []db.Repo, 1)
 		recCh   := make(chan recRes, 1)
 		colCh   := make(chan collabRes, 1)
@@ -201,9 +240,6 @@ func (h *Handler) User(w http.ResponseWriter, r *http.Request) {
 
 		go func() { v, err := h.db.UserReviewerStats(username); rrCh <- rrRes{v, err} }()
 		go func() { v, err := h.db.UserAuthorStats(username); arCh <- arRes{v, err} }()
-		go func() { v, _ := h.db.UserReviewerRank(username); rrankCh <- v }()
-		go func() { v, _ := h.db.UserGatekeeperRank(username); gkCh <- v }()
-		go func() { v, _ := h.db.UserAuthorRank(username); auCh <- v }()
 		go func() { v, _ := h.db.UserContributedRepos(username, 10); contCh <- v }()
 		go func() {
 			f, s, _ := h.db.UserRecordPRs(username)
@@ -224,9 +260,6 @@ func (h *Handler) User(w http.ResponseWriter, r *http.Request) {
 		pc = userPageCache{
 			ReviewerStats:  rrResult.v,
 			AuthorStats:    arResult.v,
-			ReviewerRank:   <-rrankCh,
-			GatekeeperRank: <-gkCh,
-			AuthorRank:     <-auCh,
 			ContribRepos:   <-contCh,
 			FastestPR:      rec.fastest,
 			SlowestPR:      rec.slowest,
@@ -247,9 +280,9 @@ func (h *Handler) User(w http.ResponseWriter, r *http.Request) {
 		IsOrg:            false,
 		ReviewerStats:    pc.ReviewerStats,
 		AuthorStats:      pc.AuthorStats,
-		ReviewerRank:     pc.ReviewerRank,
-		GatekeeperRank:   pc.GatekeeperRank,
-		AuthorRank:       pc.AuthorRank,
+		ReviewerRank:     ranks.ReviewerRank,
+		GatekeeperRank:   ranks.GatekeeperRank,
+		AuthorRank:       ranks.AuthorRank,
 		ContributedRepos: pc.ContribRepos,
 		FastestPR:        pc.FastestPR,
 		SlowestPR:        pc.SlowestPR,

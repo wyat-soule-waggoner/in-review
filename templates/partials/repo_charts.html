@@ -1,8 +1,6 @@
 {{define "repo_charts"}}
 <div id="charts-container">
 {{if or .SizeChartJSON .TimeChartJSON}}
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
-
 {{if .TimeChartJSON}}
 <div class="chart-controls">
   <div class="range-btns" id="range-btns">
