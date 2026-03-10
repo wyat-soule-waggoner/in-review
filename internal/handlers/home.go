@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"inreview/internal/db"
 )
@@ -46,15 +49,16 @@ type homeLBCache struct {
 }
 
 const homeLBCacheKey = "home:lb"
-const homeLBCacheTTL = 3 * time.Minute
+const homeLBCacheTTL = 15 * time.Minute
 
-func (h *Handler) Home(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
-	var lb homeLBCache
-	if raw, ok := h.cache.Get(ctx, homeLBCacheKey); ok {
-		_ = json.Unmarshal(raw, &lb)
-	} else {
-		// Run all independent queries concurrently; latency = slowest query.
+// homeSF deduplicates concurrent cache-miss rebuilds so only one set of
+// leaderboard queries runs even when many requests arrive simultaneously.
+var homeSF singleflight.Group
+
+// buildHomeCache runs all leaderboard queries and stores the result in Redis.
+func (h *Handler) buildHomeCache(ctx context.Context) (homeLBCache, error) {
+	v, err, _ := homeSF.Do(homeLBCacheKey, func() (interface{}, error) {
+		var lb homeLBCache
 		var wg sync.WaitGroup
 		wg.Add(8)
 		go func() { defer wg.Done(); lb.SpeedDemons, _ = h.db.LeaderboardReposBySpeed("ASC", 5) }()
@@ -83,6 +87,45 @@ func (h *Handler) Home(w http.ResponseWriter, r *http.Request) {
 		if raw, err := json.Marshal(lb); err == nil {
 			h.cache.Set(ctx, homeLBCacheKey, raw, homeLBCacheTTL)
 		}
+		return lb, nil
+	})
+	if err != nil {
+		return homeLBCache{}, err
+	}
+	return v.(homeLBCache), nil
+}
+
+// WarmHomeCache pre-builds the home leaderboard cache and then refreshes it
+// on a timer so it is never cold during normal operation. Call once at startup
+// in a goroutine.
+func (h *Handler) WarmHomeCache() {
+	ctx := context.Background()
+	log.Printf("home: warming leaderboard cache…")
+	if _, err := h.buildHomeCache(ctx); err != nil {
+		log.Printf("home: warm error: %v", err)
+	} else {
+		log.Printf("home: leaderboard cache ready")
+	}
+
+	// Refresh slightly before TTL expires so users never hit a cold cache.
+	ticker := time.NewTicker(homeLBCacheTTL - 2*time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		log.Printf("home: refreshing leaderboard cache…")
+		if _, err := h.buildHomeCache(ctx); err != nil {
+			log.Printf("home: refresh error: %v", err)
+		}
+	}
+}
+
+func (h *Handler) Home(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+	var lb homeLBCache
+	if raw, ok := h.cache.Get(ctx, homeLBCacheKey); ok {
+		_ = json.Unmarshal(raw, &lb)
+	} else {
+		// Cache miss — build synchronously (singleflight prevents stampede).
+		lb, _ = h.buildHomeCache(ctx)
 	}
 
 	data := HomeData{
