@@ -7,7 +7,7 @@
   <div class="breadcrumb">
     <a href="/" class="bc-link">ngmi</a>
     <span class="bc-sep">/</span>
-    <a href="/user/{{.Repo.Owner}}" class="bc-link">{{.Repo.Owner}}</a>
+    <a href="{{if and .OwnerUser .OwnerUser.IsOrg}}/org/{{else}}/user/{{end}}{{.Repo.Owner}}" class="bc-link">{{.Repo.Owner}}</a>
     <span class="bc-sep">/</span>
     <span class="bc-current">{{.Repo.Name}}</span>
   </div>
