@@ -97,9 +97,9 @@ func main() {
 	r.Get("/dashboard", h.RequireAuth(h.Dashboard))
 	r.Post("/api/repos/add", h.RequireAuth(h.AddRepo))
 
-	// Pre-warm the home leaderboard cache and keep it fresh in the background.
-	// This prevents the 30+ second cold-cache hit on the home page.
-	go h.WarmHomeCache()
+	// Rebuild materialized leaderboard tables and keep them fresh.
+	// Also warms the home page Redis cache. Prevents 30+ second cold-cache hits.
+	go h.WarmLeaderboards()
 
 	log.Printf("ngmi web listening on http://localhost:%s", cfg.Port)
 	log.Fatal(http.ListenAndServe(":"+cfg.Port, r))

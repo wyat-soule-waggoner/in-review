@@ -95,9 +95,41 @@ func (h *Handler) buildHomeCache(ctx context.Context) (homeLBCache, error) {
 	return v.(homeLBCache), nil
 }
 
+// WarmLeaderboards rebuilds the materialized leaderboard tables then keeps
+// them fresh on a timer. The home page Redis cache is also refreshed afterwards
+// so it immediately reflects the new data. Call once at startup in a goroutine.
+func (h *Handler) WarmLeaderboards() {
+	ctx := context.Background()
+
+	rebuild := func() {
+		log.Printf("leaderboards: refreshing materialized tables…")
+		if err := h.db.RefreshLeaderboards(); err != nil {
+			log.Printf("leaderboards: refresh error: %v", err)
+			return
+		}
+		log.Printf("leaderboards: materialized tables ready, warming home cache…")
+		// Invalidate the home Redis cache so the next rebuild reads fresh mat data.
+		h.cache.Del(ctx, homeLBCacheKey)
+		if _, err := h.buildHomeCache(ctx); err != nil {
+			log.Printf("leaderboards: home cache warm error: %v", err)
+		} else {
+			log.Printf("leaderboards: home cache ready")
+		}
+	}
+
+	rebuild()
+
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		rebuild()
+	}
+}
+
 // WarmHomeCache pre-builds the home leaderboard cache and then refreshes it
 // on a timer so it is never cold during normal operation. Call once at startup
-// in a goroutine.
+// in a goroutine. Note: if WarmLeaderboards is also running, it handles the
+// home cache too — only one of these needs to be started.
 func (h *Handler) WarmHomeCache() {
 	ctx := context.Background()
 	log.Printf("home: warming leaderboard cache…")

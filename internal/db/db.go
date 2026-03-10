@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -289,6 +290,39 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_prs_repo_merged_secs ON pull_requests(repo_full_name, merge_time_secs) WHERE merged=TRUE`,
 		// idx_prs_author_merged_at covers UserActivitySeries which groups merged PRs by month per author.
 		`CREATE INDEX IF NOT EXISTS idx_prs_author_merged_at ON pull_requests(author_login, merged_at) WHERE merged=TRUE`,
+		// Materialized leaderboard tables. Rebuilt by RefreshLeaderboards() on a background
+		// timer so all leaderboard queries become simple indexed range scans instead of
+		// full GROUP BY aggregations on 25M+ rows.
+		`CREATE TABLE IF NOT EXISTS mat_leaderboard_reviewers (
+			rank              INTEGER PRIMARY KEY,
+			login             TEXT    NOT NULL,
+			avatar_url        TEXT    NOT NULL DEFAULT '',
+			total_reviews     INTEGER NOT NULL,
+			approvals         INTEGER NOT NULL,
+			changes_requested INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS mat_leaderboard_gatekeepers (
+			rank              INTEGER PRIMARY KEY,
+			login             TEXT    NOT NULL,
+			avatar_url        TEXT    NOT NULL DEFAULT '',
+			total             INTEGER NOT NULL,
+			approvals         INTEGER NOT NULL,
+			changes_requested INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS mat_leaderboard_authors (
+			rank                INTEGER PRIMARY KEY,
+			login               TEXT    NOT NULL,
+			avatar_url          TEXT    NOT NULL DEFAULT '',
+			merged_prs          INTEGER NOT NULL,
+			avg_merge_time_secs BIGINT  NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS mat_leaderboard_clean (
+			rank           INTEGER PRIMARY KEY,
+			repo_full_name TEXT    NOT NULL,
+			total_prs      INTEGER NOT NULL,
+			clean_pct      INTEGER NOT NULL,
+			avg_secs       BIGINT  NOT NULL DEFAULT 0
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := d.conn.Exec(s); err != nil {
@@ -460,6 +494,111 @@ func (d *DB) GetUser(login string) (*User, error) {
 	return u, nil
 }
 
+// ── Materialized leaderboard refresh ───────────────────────────────────────────
+
+// RefreshLeaderboards rebuilds the four mat_leaderboard_* tables in a single
+// transaction. Readers see either the old complete dataset or the new one —
+// never an empty intermediate state. Call this from a background goroutine;
+// it runs the same heavy GROUP BY queries that previously ran on every request.
+func (d *DB) RefreshLeaderboards() error {
+	ctx := context.Background()
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("RefreshLeaderboards begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	steps := []string{
+		// ── Reviewers ──────────────────────────────────────────────────────────
+		`DELETE FROM mat_leaderboard_reviewers`,
+		`INSERT INTO mat_leaderboard_reviewers
+			  (rank, login, avatar_url, total_reviews, approvals, changes_requested)
+		 WITH top AS (
+		 	SELECT r.reviewer_login,
+		 	       MAX(COALESCE(u.avatar_url,''))                                  AS avatar_url,
+		 	       COUNT(*)                                                        AS total_reviews,
+		 	       SUM(CASE WHEN r.state='APPROVED'           THEN 1 ELSE 0 END)  AS approvals,
+		 	       SUM(CASE WHEN r.state='CHANGES_REQUESTED'  THEN 1 ELSE 0 END)  AS changes_requested
+		 	FROM reviews r
+		 	LEFT JOIN users u ON u.login = r.reviewer_login
+		 	GROUP BY r.reviewer_login
+		 	ORDER BY total_reviews DESC
+		 	LIMIT 10000
+		 )
+		 SELECT ROW_NUMBER() OVER (ORDER BY total_reviews DESC),
+		        reviewer_login, avatar_url, total_reviews, approvals, changes_requested
+		 FROM top`,
+
+		// ── Gatekeepers ────────────────────────────────────────────────────────
+		`DELETE FROM mat_leaderboard_gatekeepers`,
+		`INSERT INTO mat_leaderboard_gatekeepers
+			  (rank, login, avatar_url, total, approvals, changes_requested)
+		 WITH top AS (
+		 	SELECT r.reviewer_login,
+		 	       MAX(COALESCE(u.avatar_url,''))                                  AS avatar_url,
+		 	       COUNT(*)                                                        AS total,
+		 	       SUM(CASE WHEN r.state='APPROVED'           THEN 1 ELSE 0 END)  AS approvals,
+		 	       SUM(CASE WHEN r.state='CHANGES_REQUESTED'  THEN 1 ELSE 0 END)  AS changes_requested
+		 	FROM reviews r
+		 	LEFT JOIN users u ON u.login = r.reviewer_login
+		 	WHERE r.state = 'CHANGES_REQUESTED'
+		 	GROUP BY r.reviewer_login
+		 	ORDER BY total DESC
+		 	LIMIT 10000
+		 )
+		 SELECT ROW_NUMBER() OVER (ORDER BY total DESC),
+		        reviewer_login, avatar_url, total, approvals, changes_requested
+		 FROM top`,
+
+		// ── Authors ────────────────────────────────────────────────────────────
+		`DELETE FROM mat_leaderboard_authors`,
+		`INSERT INTO mat_leaderboard_authors
+			  (rank, login, avatar_url, merged_prs, avg_merge_time_secs)
+		 WITH top AS (
+		 	SELECT p.author_login,
+		 	       MAX(COALESCE(u.avatar_url,''))         AS avatar_url,
+		 	       COUNT(*)                               AS merged_prs,
+		 	       COALESCE(AVG(p.merge_time_secs),0)::BIGINT AS avg_merge_time_secs
+		 	FROM pull_requests p
+		 	LEFT JOIN users u ON u.login = p.author_login
+		 	WHERE p.merged = TRUE
+		 	GROUP BY p.author_login
+		 	ORDER BY merged_prs DESC
+		 	LIMIT 10000
+		 )
+		 SELECT ROW_NUMBER() OVER (ORDER BY merged_prs DESC),
+		        author_login, avatar_url, merged_prs, avg_merge_time_secs
+		 FROM top`,
+
+		// ── Clean approvals ────────────────────────────────────────────────────
+		`DELETE FROM mat_leaderboard_clean`,
+		`INSERT INTO mat_leaderboard_clean
+			  (rank, repo_full_name, total_prs, clean_pct, avg_secs)
+		 WITH top AS (
+		 	SELECT repo_full_name,
+		 	       COUNT(*)                                                                                 AS total_prs,
+		 	       CAST(ROUND(100.0 * SUM(CASE WHEN changes_requested_count=0 AND review_count>0 THEN 1 ELSE 0 END) / COUNT(*)) AS INTEGER) AS clean_pct,
+		 	       COALESCE(AVG(merge_time_secs),0)::BIGINT                                                AS avg_secs
+		 	FROM pull_requests
+		 	WHERE merged=TRUE AND review_count>0
+		 	GROUP BY repo_full_name
+		 	HAVING COUNT(*) >= 5
+		 	ORDER BY clean_pct DESC
+		 	LIMIT 10000
+		 )
+		 SELECT ROW_NUMBER() OVER (ORDER BY clean_pct DESC),
+		        repo_full_name, total_prs, clean_pct, avg_secs
+		 FROM top`,
+	}
+
+	for _, s := range steps {
+		if _, err := tx.Exec(s); err != nil {
+			return fmt.Errorf("RefreshLeaderboards: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
 // ── Leaderboards ───────────────────────────────────────────────────────────────
 
 func (d *DB) LeaderboardReposBySpeed(order string, limit int) ([]LeaderboardEntry, error) {
@@ -474,64 +613,47 @@ func (d *DB) LeaderboardReposBySpeed(order string, limit int) ([]LeaderboardEntr
 
 func (d *DB) LeaderboardReviewers(limit int) ([]LeaderboardEntry, error) {
 	return d.queryEntries(`
-		SELECT r.reviewer_login, COUNT(*) as cnt, MAX(COALESCE(u.avatar_url,''))
-		FROM reviews r
-		LEFT JOIN users u ON u.login=r.reviewer_login
-		WHERE r.state IN ('APPROVED','CHANGES_REQUESTED','COMMENTED')
-		GROUP BY r.reviewer_login
-		ORDER BY cnt DESC
+		SELECT login, total_reviews, avatar_url
+		FROM mat_leaderboard_reviewers
+		ORDER BY rank
 		LIMIT $1`, limit)
 }
 
 func (d *DB) LeaderboardGatekeepers(limit int) ([]LeaderboardEntry, error) {
 	return d.queryEntries(`
-		SELECT r.reviewer_login, COUNT(*) as cnt, MAX(COALESCE(u.avatar_url,''))
-		FROM reviews r
-		LEFT JOIN users u ON u.login=r.reviewer_login
-		WHERE r.state='CHANGES_REQUESTED'
-		GROUP BY r.reviewer_login
-		ORDER BY cnt DESC
+		SELECT login, total, avatar_url
+		FROM mat_leaderboard_gatekeepers
+		ORDER BY rank
 		LIMIT $1`, limit)
 }
 
 func (d *DB) LeaderboardAuthors(limit int) ([]LeaderboardEntry, error) {
 	return d.queryEntries(`
-		SELECT p.author_login, COUNT(*) as cnt, MAX(COALESCE(u.avatar_url,''))
-		FROM pull_requests p
-		LEFT JOIN users u ON u.login=p.author_login
-		WHERE p.merged=TRUE
-		GROUP BY p.author_login
-		ORDER BY cnt DESC
+		SELECT login, merged_prs, avatar_url
+		FROM mat_leaderboard_authors
+		ORDER BY rank
 		LIMIT $1`, limit)
 }
 
 func (d *DB) LeaderboardCleanApprovals(limit int) ([]LeaderboardEntry, error) {
 	rows, err := d.conn.Query(`
-		SELECT repo_full_name,
-		       COUNT(*) as total,
-		       CAST(ROUND(100.0 * SUM(CASE WHEN changes_requested_count=0 AND review_count>0 THEN 1 ELSE 0 END) / COUNT(*)) AS INTEGER) as clean_pct
-		FROM pull_requests
-		WHERE merged=TRUE AND review_count>0
-		GROUP BY repo_full_name
-		HAVING COUNT(*) >= 5
-		ORDER BY clean_pct DESC
+		SELECT rank, repo_full_name, clean_pct
+		FROM mat_leaderboard_clean
+		ORDER BY rank
 		LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var entries []LeaderboardEntry
-	rank := 1
 	for rows.Next() {
 		var e LeaderboardEntry
 		var cleanPct int
-		if err := rows.Scan(&e.Name, &e.Count, &cleanPct); err != nil {
+		if err := rows.Scan(&e.Rank, &e.Name, &cleanPct); err != nil {
 			continue
 		}
-		e.Rank = rank
 		e.Value = int64(cleanPct)
 		entries = append(entries, e)
-		rank++
 	}
 	return entries, rows.Err()
 }
@@ -848,57 +970,35 @@ func (d *DB) FullLeaderboardRepoSpeed(order string, limit, offset int) ([]RepoLe
 
 func (d *DB) FullLeaderboardReviewers(limit, offset int) ([]UserLeaderboardRow, error) {
 	rows, err := d.conn.Query(`
-		SELECT r.reviewer_login,
-		       MAX(COALESCE(u.avatar_url, '')),
-		       COUNT(*) as total,
-		       SUM(CASE WHEN r.state='APPROVED'          THEN 1 ELSE 0 END),
-		       SUM(CASE WHEN r.state='CHANGES_REQUESTED' THEN 1 ELSE 0 END)
-		FROM reviews r
-		LEFT JOIN users u ON u.login = r.reviewer_login
-		GROUP BY r.reviewer_login
-		ORDER BY total DESC
+		SELECT rank, login, avatar_url, total_reviews, approvals, changes_requested
+		FROM mat_leaderboard_reviewers
+		ORDER BY rank
 		LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanUserRows(rows, offset+1)
+	return scanMatUserRows(rows)
 }
 
 func (d *DB) FullLeaderboardGatekeepers(limit, offset int) ([]UserLeaderboardRow, error) {
 	rows, err := d.conn.Query(`
-		SELECT r.reviewer_login,
-		       MAX(COALESCE(u.avatar_url, '')),
-		       COUNT(*) as total,
-		       SUM(CASE WHEN r.state='APPROVED'          THEN 1 ELSE 0 END),
-		       SUM(CASE WHEN r.state='CHANGES_REQUESTED' THEN 1 ELSE 0 END)
-		FROM reviews r
-		LEFT JOIN users u ON u.login = r.reviewer_login
-		WHERE r.state = 'CHANGES_REQUESTED'
-		GROUP BY r.reviewer_login
-		ORDER BY total DESC
+		SELECT rank, login, avatar_url, total, approvals, changes_requested
+		FROM mat_leaderboard_gatekeepers
+		ORDER BY rank
 		LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanUserRows(rows, offset+1)
+	return scanMatUserRows(rows)
 }
 
 func (d *DB) FullLeaderboardAuthors(limit, offset int) ([]UserLeaderboardRow, error) {
 	rows, err := d.conn.Query(`
-		SELECT p.author_login,
-		       MAX(COALESCE(u.avatar_url, '')),
-		       COUNT(*) as merged,
-		       0 as approvals,
-		       0 as changes,
-		       COUNT(*) as merged_prs,
-		       COALESCE(AVG(p.merge_time_secs), 0)::BIGINT as avg_secs
-		FROM pull_requests p
-		LEFT JOIN users u ON u.login = p.author_login
-		WHERE p.merged = TRUE
-		GROUP BY p.author_login
-		ORDER BY merged DESC
+		SELECT rank, login, avatar_url, merged_prs, avg_merge_time_secs
+		FROM mat_leaderboard_authors
+		ORDER BY rank
 		LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("FullLeaderboardAuthors: %w", err)
@@ -908,11 +1008,12 @@ func (d *DB) FullLeaderboardAuthors(limit, offset int) ([]UserLeaderboardRow, er
 	rank := offset + 1
 	for rows.Next() {
 		var r UserLeaderboardRow
-		if err := rows.Scan(&r.Login, &r.AvatarURL, &r.Total, &r.Approvals, &r.ChangesRequested, &r.MergedPRs, &r.AvgMergeTimeSecs); err != nil {
+		if err := rows.Scan(&r.Rank, &r.Login, &r.AvatarURL, &r.MergedPRs, &r.AvgMergeTimeSecs); err != nil {
 			log.Printf("db: FullLeaderboardAuthors scan error: %v", err)
 			continue
 		}
-		r.Rank = rank
+		r.Total = r.MergedPRs
+		_ = rank
 		out = append(out, r)
 		rank++
 	}
@@ -921,33 +1022,37 @@ func (d *DB) FullLeaderboardAuthors(limit, offset int) ([]UserLeaderboardRow, er
 
 func (d *DB) FullLeaderboardCleanApprovals(limit, offset int) ([]CleanLeaderboardRow, error) {
 	rows, err := d.conn.Query(`
-		SELECT repo_full_name,
-		       COUNT(*) as total,
-		       CAST(ROUND(100.0 * SUM(CASE WHEN changes_requested_count=0 AND review_count>0 THEN 1 ELSE 0 END) / COUNT(*)) AS INTEGER) as clean_pct,
-		       COALESCE(AVG(merge_time_secs), 0) as avg_secs
-		FROM pull_requests
-		WHERE merged=TRUE AND review_count>0
-		GROUP BY repo_full_name
-		HAVING COUNT(*) >= 5
-		ORDER BY clean_pct DESC
+		SELECT rank, repo_full_name, total_prs, clean_pct, avg_secs
+		FROM mat_leaderboard_clean
+		ORDER BY rank
 		LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []CleanLeaderboardRow
-	rank := offset + 1
 	for rows.Next() {
 		var r CleanLeaderboardRow
-		var avgSecs float64
-		if err := rows.Scan(&r.FullName, &r.Total, &r.CleanPct, &avgSecs); err != nil {
+		if err := rows.Scan(&r.Rank, &r.FullName, &r.Total, &r.CleanPct, &r.AvgSecs); err != nil {
 			log.Printf("db: FullLeaderboardCleanApprovals scan error: %v", err)
 			continue
 		}
-		r.AvgSecs = int64(avgSecs)
-		r.Rank = rank
 		out = append(out, r)
-		rank++
+	}
+	return out, rows.Err()
+}
+
+// scanMatUserRows scans rows from mat_leaderboard_reviewers / mat_leaderboard_gatekeepers
+// which have columns: rank, login, avatar_url, total, approvals, changes_requested.
+func scanMatUserRows(rows *sql.Rows) ([]UserLeaderboardRow, error) {
+	var out []UserLeaderboardRow
+	for rows.Next() {
+		var r UserLeaderboardRow
+		if err := rows.Scan(&r.Rank, &r.Login, &r.AvatarURL, &r.Total, &r.Approvals, &r.ChangesRequested); err != nil {
+			log.Printf("db: scanMatUserRows scan error: %v", err)
+			continue
+		}
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }
