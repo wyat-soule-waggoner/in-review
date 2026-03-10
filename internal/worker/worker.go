@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -212,8 +213,13 @@ func (w *Worker) syncRepo(fullName string) {
 	gh := w.installationClient(ctx, owner)
 	result, err := gh.SyncRepo(ctx, owner, name, maxPRsPerRepo)
 	if err != nil {
-		log.Printf("[sync] error fetching %s: %v", fullName, err)
-		w.db.UpdateSyncStatus(fullName, "error")
+		if errors.Is(err, github.ErrNotFound) {
+			log.Printf("[sync] abandoned %s: repo not found (deleted or private)", fullName)
+			w.db.UpdateSyncStatus(fullName, "abandoned")
+		} else {
+			log.Printf("[sync] error fetching %s: %v", fullName, err)
+			w.db.UpdateSyncStatus(fullName, "error")
+		}
 		return
 	}
 

@@ -279,6 +279,8 @@ func (d *DB) migrate() error {
 		// Indexes for leaderboard GROUP BY queries.
 		`CREATE INDEX IF NOT EXISTS idx_rev_state ON reviews(state)`,
 		`CREATE INDEX IF NOT EXISTS idx_prs_author_merged ON pull_requests(author_login) WHERE merged=TRUE`,
+		// Retry tracking: stop re-queuing repos that have failed repeatedly.
+		`ALTER TABLE repos ADD COLUMN IF NOT EXISTS error_count INT NOT NULL DEFAULT 0`,
 	}
 	for _, s := range stmts {
 		if _, err := d.conn.Exec(s); err != nil {
@@ -305,16 +307,23 @@ func (d *DB) UpsertRepo(r Repo) error {
 }
 
 func (d *DB) UpdateSyncStatus(fullName, status string) error {
-	if status == "done" {
+	switch status {
+	case "done":
 		_, err := d.conn.Exec(
-			`UPDATE repos SET sync_status=$1, last_synced=NOW(), updated_at=NOW() WHERE full_name=$2`,
+			`UPDATE repos SET sync_status=$1, last_synced=NOW(), updated_at=NOW(), error_count=0 WHERE full_name=$2`,
+			status, fullName)
+		return err
+	case "error":
+		_, err := d.conn.Exec(
+			`UPDATE repos SET sync_status=$1, updated_at=NOW(), error_count=error_count+1 WHERE full_name=$2`,
+			status, fullName)
+		return err
+	default:
+		_, err := d.conn.Exec(
+			`UPDATE repos SET sync_status=$1, updated_at=NOW() WHERE full_name=$2`,
 			status, fullName)
 		return err
 	}
-	_, err := d.conn.Exec(
-		`UPDATE repos SET sync_status=$1, updated_at=NOW() WHERE full_name=$2`,
-		status, fullName)
-	return err
 }
 
 func (d *DB) UpsertPR(pr PullRequest) error {
@@ -2008,7 +2017,7 @@ func (d *DB) UnsyncedRepos(limit int, errorCooldown time.Duration) ([]string, er
 	rows, err := d.conn.Query(`
 		SELECT full_name FROM repos
 		WHERE sync_status = 'pending'
-		   OR (sync_status = 'error' AND updated_at < NOW() - $2::interval)
+		   OR (sync_status = 'error' AND error_count < 5 AND updated_at < NOW() - $2::interval)
 		ORDER BY updated_at ASC
 		LIMIT $1
 	`, limit, fmt.Sprintf("%d seconds", int(errorCooldown.Seconds())))

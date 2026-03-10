@@ -19,7 +19,6 @@ import (
 )
 
 func main() {
-	// Load .env if present (ignored if missing)
 	_ = godotenv.Load()
 
 	cfg := config.Load()
@@ -27,33 +26,27 @@ func main() {
 		log.Println("WARNING: GITHUB_TOKEN not set — using unauthenticated API (60 req/hr limit)")
 	}
 
-	// Database
 	database, err := db.New(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}
 	defer database.Close()
 
-	// Redis
 	cache, err := rdb.New(cfg.RedisURL)
 	if err != nil {
 		log.Fatalf("failed to connect to redis: %v", err)
 	}
 	defer cache.Close()
 
-	// GitHub client
 	ghClient := github.NewClient(cfg.GitHubToken)
-
-	// Analytics
 	ph := analytics.New(cfg.PostHogAPIKey)
 	defer ph.Close()
 
-	// Sync worker
-	w := worker.New(ghClient, database, cache, cfg.GitHubAppID, cfg.GitHubAppPrivateKey)
-	w.Start()
+	// Create the worker for queue operations (Queue/IsSyncing/QueuePosition)
+	// but do NOT call Start() — sync goroutines run in the sync binary.
+	q := worker.New(ghClient, database, cache, cfg.GitHubAppID, cfg.GitHubAppPrivateKey)
 
-	// HTTP router
-	h := handlers.New(database, ghClient, w, cache, cfg, ph)
+	h := handlers.New(database, ghClient, q, cache, cfg, ph)
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -93,17 +86,15 @@ func main() {
 	r.Get("/blog", h.Blog)
 	r.Get("/api/blog/stats", h.BlogLiveStats)
 
-	// Auth routes
 	r.Get("/auth/login", h.AuthLogin)
 	r.Get("/auth/github", h.AuthGitHub)
 	r.Get("/auth/github/callback", h.AuthGitHubCallback)
 	r.Post("/auth/logout", h.AuthLogout)
 	r.Post("/api/github/webhook", h.GitHubWebhook)
 
-	// Authenticated routes
 	r.Get("/dashboard", h.RequireAuth(h.Dashboard))
 	r.Post("/api/repos/add", h.RequireAuth(h.AddRepo))
 
-	log.Printf("ngmi listening on http://localhost:%s", cfg.Port)
+	log.Printf("ngmi web listening on http://localhost:%s", cfg.Port)
 	log.Fatal(http.ListenAndServe(":"+cfg.Port, r))
 }

@@ -15,7 +15,6 @@ import (
 	"inreview/internal/db"
 	"inreview/internal/github"
 	"inreview/internal/rdb"
-	"inreview/internal/worker"
 )
 
 // contextKey is a private type for context values to avoid collisions.
@@ -101,11 +100,20 @@ func (h *Handler) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// Queuer is the subset of worker.Worker used by HTTP handlers.
+// Both the web-only and combined binaries satisfy this with a *worker.Worker;
+// the difference is whether Worker.Start() has been called.
+type Queuer interface {
+	Queue(fullName string, force bool)
+	IsSyncing(fullName string) bool
+	QueuePosition(fullName string) int
+}
+
 // Handler holds all dependencies and parsed templates.
 type Handler struct {
 	db        *db.DB
 	gh        *github.Client
-	worker    *worker.Worker
+	worker    Queuer
 	cache     *rdb.Client
 	cfg       *config.Config
 	analytics *analytics.Client
@@ -113,7 +121,7 @@ type Handler struct {
 	funcMap   template.FuncMap
 }
 
-func New(database *db.DB, gh *github.Client, w *worker.Worker, cache *rdb.Client, cfg *config.Config, a *analytics.Client) *Handler {
+func New(database *db.DB, gh *github.Client, w Queuer, cache *rdb.Client, cfg *config.Config, a *analytics.Client) *Handler {
 	h := &Handler{
 		db:        database,
 		gh:        gh,
